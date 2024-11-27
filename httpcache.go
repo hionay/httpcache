@@ -22,6 +22,8 @@ const (
 	XFromCache = "X-From-Cache"
 	// XStale is the header added to responses that are stale
 	XStale = "X-Stale"
+	// XRevalidated is the header added to responses that got revalidated
+	XRevalidated = "X-Revalidated"
 )
 
 const (
@@ -194,6 +196,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			endToEndHeaders := getEndToEndHeaders(resp.Header)
 			for _, header := range endToEndHeaders {
 				cachedResp.Header[header] = resp.Header[header]
+			}
+			if t.MarkCachedResponses {
+				cachedResp.Header[XRevalidated] = []string{"1"}
 			}
 			if resp != nil {
 				_ = drainBody(resp.Body)
