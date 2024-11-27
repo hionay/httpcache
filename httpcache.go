@@ -18,11 +18,16 @@ import (
 )
 
 const (
+	// XFromCache is the header added to responses that are returned from the cache
+	XFromCache = "X-From-Cache"
+	// XStale is the header added to responses that are stale
+	XStale = "X-Stale"
+)
+
+const (
 	stale = iota
 	fresh
 	transparent
-	// XFromCache is the header added to responses that are returned from the cache
-	XFromCache = "X-From-Cache"
 )
 
 // A Cache interface is used by the Transport to store and retrieve responses.
@@ -200,6 +205,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			// when available
 			if resp != nil {
 				_ = drainBody(resp.Body)
+			}
+			if t.MarkCachedResponses {
+				cachedResp.Header[XStale] = []string{"1"}
 			}
 			return cachedResp, nil
 		} else {
