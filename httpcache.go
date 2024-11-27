@@ -3,7 +3,6 @@
 //
 // It is only suitable for use as a 'private' cache (i.e. for a web-browser or an API-client
 // and not for a shared proxy).
-//
 package httpcache
 
 import (
@@ -11,7 +10,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"strings"
@@ -192,11 +190,17 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			for _, header := range endToEndHeaders {
 				cachedResp.Header[header] = resp.Header[header]
 			}
+			if resp != nil {
+				_ = drainBody(resp.Body)
+			}
 			resp = cachedResp
-		} else if (err != nil || (cachedResp != nil && resp.StatusCode >= 500)) &&
+		} else if (err != nil || resp.StatusCode >= 500) &&
 			req.Method == "GET" && canStaleOnError(cachedResp.Header, req.Header) {
 			// In case of transport failure and stale-if-error activated, returns cached content
 			// when available
+			if resp != nil {
+				_ = drainBody(resp.Body)
+			}
 			return cachedResp, nil
 		} else {
 			if err != nil || resp.StatusCode != http.StatusOK {
@@ -234,7 +238,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 				R: resp.Body,
 				OnEOF: func(r io.Reader) {
 					resp := *resp
-					resp.Body = ioutil.NopCloser(r)
+					resp.Body = io.NopCloser(r)
 					respBytes, err := httputil.DumpResponse(&resp, true)
 					if err == nil {
 						t.Cache.Set(cacheKey, respBytes)
@@ -548,4 +552,15 @@ func NewMemoryCacheTransport() *Transport {
 	c := NewMemoryCache()
 	t := NewTransport(c)
 	return t
+}
+
+const drainSize = 32 * 1024
+
+func drainBody(body io.ReadCloser) (err error) {
+	if body == nil {
+		return
+	}
+	defer func() { err = body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, drainSize))
+	return
 }
