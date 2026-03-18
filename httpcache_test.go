@@ -418,7 +418,7 @@ func TestCacheOnJsonBodyRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer resp.Body.Close()
+
 		var r json.RawMessage
 		err = json.NewDecoder(resp.Body).Decode(&r)
 		if err != nil {
@@ -427,6 +427,7 @@ func TestCacheOnJsonBodyRead(t *testing.T) {
 		if resp.Header.Get(XFromCache) != "" {
 			t.Fatalf("XFromCache header isn't blank")
 		}
+		_ = resp.Body.Close()
 	}
 	{
 		req, err := http.NewRequest("GET", s.server.URL+"/json", nil)
