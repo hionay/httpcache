@@ -189,6 +189,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 					req = req2
 				}
 			}
+		} else {
+			// Cached response won't be used so close its body.
+			_ = drainBody(cachedResp.Body)
 		}
 
 		resp, err = transport.RoundTrip(req)
@@ -539,7 +542,9 @@ type cachingReadCloser struct {
 	// OnEOF is called with a copy of the content of R when EOF is reached.
 	OnEOF func(io.Reader)
 
-	buf bytes.Buffer // buf stores a copy of the content of R.
+	buf         bytes.Buffer // buf stores a copy of the content of R.
+	eofOnce     sync.Once
+	readStarted bool
 }
 
 // Read reads the next len(p) bytes from R or until R is drained. The
@@ -548,14 +553,26 @@ type cachingReadCloser struct {
 // has been read so far.
 func (r *cachingReadCloser) Read(p []byte) (n int, err error) {
 	n, err = r.R.Read(p)
+	r.readStarted = true
 	r.buf.Write(p[:n])
-	if err == io.EOF || n < len(p) {
-		r.OnEOF(bytes.NewReader(r.buf.Bytes()))
+	if err == io.EOF {
+		r.eofOnce.Do(func() {
+			r.OnEOF(bytes.NewReader(r.buf.Bytes()))
+		})
 	}
 	return n, err
 }
 
 func (r *cachingReadCloser) Close() error {
+	if r.readStarted {
+		r.eofOnce.Do(func() {
+			const maxDrain = 1024 * 1024
+			n, err := io.Copy(&r.buf, io.LimitReader(r.R, maxDrain))
+			if err == nil && n < maxDrain {
+				r.OnEOF(bytes.NewReader(r.buf.Bytes()))
+			}
+		})
+	}
 	return r.R.Close()
 }
 
