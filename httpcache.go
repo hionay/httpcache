@@ -65,7 +65,7 @@ func CachedResponse(c Cache, req *http.Request) (resp *http.Response, err error)
 	return http.ReadResponse(bufio.NewReader(b), req)
 }
 
-// MemoryCache is an implemtation of Cache that stores responses in an in-memory map.
+// MemoryCache is an implementation of Cache that stores responses in an in-memory map.
 type MemoryCache struct {
 	mu    sync.RWMutex
 	items map[string][]byte
@@ -127,6 +127,9 @@ func (t *Transport) Client() *http.Client {
 func varyMatches(cachedResp *http.Response, req *http.Request) bool {
 	for _, header := range headerAllCommaSepValues(cachedResp.Header, "vary") {
 		header = http.CanonicalHeaderKey(header)
+		if header == "*" {
+			return false
+		}
 		if header != "" && req.Header.Get(header) != cachedResp.Header.Get("X-Varied-"+header) {
 			return false
 		}
@@ -506,8 +509,8 @@ func parseCacheControl(headers http.Header) cacheControl {
 			continue
 		}
 		if strings.ContainsRune(part, '=') {
-			keyval := strings.Split(part, "=")
-			cc[strings.Trim(keyval[0], " ")] = strings.Trim(keyval[1], ",")
+			keyval := strings.SplitN(part, "=", 2)
+			cc[strings.Trim(keyval[0], " ")] = strings.Trim(keyval[1], " ")
 		} else {
 			cc[part] = ""
 		}
