@@ -212,7 +212,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			}
 			resp = cachedResp
 		} else if (err != nil || resp.StatusCode >= 500) &&
-			req.Method == "GET" && canStaleOnError(cachedResp.Header, req.Header) {
+			(req.Method == "GET" || req.Method == "HEAD") && canStaleOnError(cachedResp.Header, req.Header) {
 			// In case of transport failure and stale-if-error activated, returns cached content
 			// when available
 			if resp != nil {
@@ -233,12 +233,13 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	} else {
 		reqCacheControl := parseCacheControl(req.Header)
 		if _, ok := reqCacheControl["only-if-cached"]; ok {
-			resp = newGatewayTimeoutResponse(req)
-		} else {
-			resp, err = transport.RoundTrip(req)
-			if err != nil {
-				return nil, err
-			}
+			// Don't fall through to the store block: the synthetic 504
+			// must not be written to the cache.
+			return newGatewayTimeoutResponse(req), nil
+		}
+		resp, err = transport.RoundTrip(req)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -387,6 +388,10 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	}
 
 	if maxstale, ok := reqCacheControl["max-stale"]; ok {
+		// A response with must-revalidate can never be served stale (RFC 9111 section 5.2.2.2).
+		if _, mustRevalidate := respCacheControl["must-revalidate"]; mustRevalidate {
+			return stale
+		}
 		// Indicates that the client is willing to accept a response that has exceeded its expiration time.
 		// If max-stale is assigned a value, then the client is willing to accept a response that has exceeded
 		// its expiration time by no more than the specified number of seconds.
@@ -416,6 +421,11 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 func canStaleOnError(respHeaders, reqHeaders http.Header) bool {
 	respCacheControl := parseCacheControl(respHeaders)
 	reqCacheControl := parseCacheControl(reqHeaders)
+
+	// stale-if-error doesn't override must-revalidate (RFC 5861 section 4).
+	if _, ok := respCacheControl["must-revalidate"]; ok {
+		return false
+	}
 
 	var err error
 	lifetime := time.Duration(-1)
@@ -447,6 +457,11 @@ func canStaleOnError(respHeaders, reqHeaders http.Header) bool {
 			return false
 		}
 		currentAge := clock.since(date)
+		if ageHeader := respHeaders.Get("Age"); ageHeader != "" {
+			if age, err := time.ParseDuration(ageHeader + "s"); err == nil && age > currentAge {
+				currentAge = age
+			}
+		}
 		if lifetime > currentAge {
 			return true
 		}

@@ -1621,6 +1621,129 @@ func TestMarkerHeadersNotStored(t *testing.T) {
 	}
 }
 
+// A response with must-revalidate must never be served stale, even if the
+// request allows it via max-stale (RFC 9111 section 5.2.2.2).
+func TestMaxStaleWithMustRevalidate(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "max-age=10, must-revalidate")
+
+	reqHeaders := http.Header{}
+	reqHeaders.Set("cache-control", "max-stale")
+	clock = &fakeClock{elapsed: 60 * time.Second}
+	if getFreshness(respHeaders, reqHeaders) != stale {
+		t.Fatal("freshness isn't stale")
+	}
+
+	reqHeaders.Set("cache-control", "max-stale=100")
+	if getFreshness(respHeaders, reqHeaders) != stale {
+		t.Fatal("freshness isn't stale")
+	}
+}
+
+// stale-if-error doesn't override must-revalidate (RFC 5861 section 4).
+func TestStaleIfErrorWithMustRevalidate(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "must-revalidate, stale-if-error")
+
+	reqHeaders := http.Header{}
+	if canStaleOnError(respHeaders, reqHeaders) {
+		t.Fatal("canStaleOnError should be false with must-revalidate")
+	}
+}
+
+// The Age response header counts towards the response's current age for
+// stale-if-error lifetime checks too.
+func TestStaleIfErrorRespectsAgeHeader(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "stale-if-error=100")
+	respHeaders.Set("age", "200")
+
+	reqHeaders := http.Header{}
+	if canStaleOnError(respHeaders, reqHeaders) {
+		t.Fatal("canStaleOnError should be false when Age exceeds lifetime")
+	}
+}
+
+// The synthetic 504 generated for an only-if-cached miss must not be stored
+// in the cache.
+func TestOnlyIfCachedMissNotStored(t *testing.T) {
+	resetTest()
+	req, err := http.NewRequest("GET", s.server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("cache-control", "only-if-cached")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("response status code isn't 504 GatewayTimeout: %v", resp.StatusCode)
+	}
+	_, err = io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if _, ok := s.transport.Cache.Get(s.server.URL); ok {
+		t.Fatal("synthetic 504 response was stored in cache")
+	}
+}
+
+// stale-if-error applies to cached HEAD responses as well as GET.
+func TestStaleIfErrorHead(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	tmock := transportMock{
+		response: &http.Response{
+			Status:     http.StatusText(http.StatusOK),
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Date":          []string{now.Format(time.RFC1123)},
+				"Cache-Control": []string{"no-cache"},
+			},
+			Body: io.NopCloser(bytes.NewBuffer(nil)),
+		},
+		err: nil,
+	}
+	tp := NewMemoryCacheTransport()
+	tp.Transport = &tmock
+
+	// First time, response is cached on success
+	r, _ := http.NewRequest("HEAD", "http://somewhere.com/", nil)
+	r.Header.Set("Cache-Control", "stale-if-error")
+	resp, err := tp.RoundTrip(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil {
+		t.Fatal("resp is nil")
+	}
+
+	// On failure, response is returned from the cache
+	tmock.response = nil
+	tmock.err = errors.New("some error")
+	resp, err = tp.RoundTrip(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil {
+		t.Fatal("resp is nil")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("response status code isn't 200 OK: %v", resp.StatusCode)
+	}
+}
+
 // Test that http.Client.Timeout is respected when cache transport is used.
 // That is so as long as request cancellation is propagated correctly.
 // In the past, that required CancelRequest to be implemented correctly,
