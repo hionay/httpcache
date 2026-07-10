@@ -198,7 +198,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		}
 
 		resp, err = transport.RoundTrip(req)
-		if err == nil && req.Method == "GET" && resp.StatusCode == http.StatusNotModified {
+		if err == nil && (req.Method == "GET" || req.Method == "HEAD") && resp.StatusCode == http.StatusNotModified {
 			// Replace the 304 response with the one from cache, but update with some new headers
 			endToEndHeaders := getEndToEndHeaders(resp.Header)
 			for _, header := range endToEndHeaders {
@@ -259,14 +259,14 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 				OnEOF: func(r io.Reader) {
 					resp := *resp
 					resp.Body = io.NopCloser(r)
-					respBytes, err := httputil.DumpResponse(&resp, true)
+					respBytes, err := dumpResponseForStore(&resp)
 					if err == nil {
 						t.Cache.Set(cacheKey, respBytes)
 					}
 				},
 			}
 		default:
-			respBytes, err := httputil.DumpResponse(resp, true)
+			respBytes, err := dumpResponseForStore(resp)
 			if err == nil {
 				t.Cache.Set(cacheKey, respBytes)
 			}
@@ -288,7 +288,16 @@ func Date(respHeaders http.Header) (date time.Time, err error) {
 		return
 	}
 
-	return time.Parse(time.RFC1123, dateHeader)
+	return parseHTTPDate(dateHeader)
+}
+
+// parseHTTPDate parses an HTTP date in any of the three formats allowed by
+// RFC 9110 (via http.ParseTime), falling back to RFC 1123 with a non-GMT zone.
+func parseHTTPDate(s string) (time.Time, error) {
+	if t, err := http.ParseTime(s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC1123, s)
 }
 
 type realClock struct{}
@@ -330,6 +339,11 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 		return stale
 	}
 	currentAge := clock.since(date)
+	if ageHeader := respHeaders.Get("Age"); ageHeader != "" {
+		if age, err := time.ParseDuration(ageHeader + "s"); err == nil && age > currentAge {
+			currentAge = age
+		}
+	}
 
 	var lifetime time.Duration
 	var zeroDuration time.Duration
@@ -344,7 +358,7 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	} else {
 		expiresHeader := respHeaders.Get("Expires")
 		if expiresHeader != "" {
-			expires, err := time.Parse(time.RFC1123, expiresHeader)
+			expires, err := parseHTTPDate(expiresHeader)
 			if err != nil {
 				lifetime = zeroDuration
 			} else {
@@ -354,10 +368,14 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	}
 
 	if maxAge, ok := reqCacheControl["max-age"]; ok {
-		// the client is willing to accept a response whose age is no greater than the specified time in seconds
-		lifetime, err = time.ParseDuration(maxAge + "s")
+		// the client is willing to accept a response whose age is no greater than the
+		// specified time in seconds; it can only tighten the lifetime, never extend it
+		reqLifetime, err := time.ParseDuration(maxAge + "s")
 		if err != nil {
-			lifetime = zeroDuration
+			reqLifetime = zeroDuration
+		}
+		if reqLifetime < lifetime {
+			lifetime = reqLifetime
 		}
 	}
 	if minfresh, ok := reqCacheControl["min-fresh"]; ok {
@@ -473,6 +491,21 @@ func canStore(reqCacheControl, respCacheControl cacheControl) (canStore bool) {
 		return false
 	}
 	return true
+}
+
+// dumpResponseForStore serializes resp for storage, without the marker
+// headers (X-From-Cache etc.) that are meant for the caller only. Like
+// httputil.DumpResponse, it consumes resp.Body and replaces it with a
+// fresh reader over the same bytes.
+func dumpResponseForStore(resp *http.Response) ([]byte, error) {
+	stripped := *resp
+	stripped.Header = resp.Header.Clone()
+	stripped.Header.Del(XFromCache)
+	stripped.Header.Del(XStale)
+	stripped.Header.Del(XRevalidated)
+	b, err := httputil.DumpResponse(&stripped, true)
+	resp.Body = stripped.Body
+	return b, err
 }
 
 func newGatewayTimeoutResponse(req *http.Request) *http.Response {

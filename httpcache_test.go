@@ -1496,6 +1496,131 @@ func TestStaleIfErrorKeepsStatus(t *testing.T) {
 	}
 }
 
+// Request max-age can only tighten the response's freshness lifetime,
+// never extend it (RFC 9111 section 5.2.1.1).
+func TestReqMaxAgeDoesNotExtendFreshness(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "max-age=60")
+
+	reqHeaders := http.Header{}
+	reqHeaders.Set("cache-control", "max-age=3600")
+	clock = &fakeClock{elapsed: 120 * time.Second}
+	if getFreshness(respHeaders, reqHeaders) != stale {
+		t.Fatal("freshness isn't stale")
+	}
+}
+
+// A stale cached HEAD response must be revalidated and served from cache on
+// 304, not leak the raw 304 to the caller.
+func TestHeadRevalidatedFromCache(t *testing.T) {
+	resetTest()
+	req, err := http.NewRequest(http.MethodHead, s.server.URL+"/lastmodified", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	{
+		resp, err := s.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("response status code isn't 200 OK: %v", resp.StatusCode)
+		}
+	}
+	{
+		resp, err := s.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("response status code isn't 200 OK: %v", resp.StatusCode)
+		}
+		if resp.Header.Get(XFromCache) != "1" {
+			t.Fatalf(`XFromCache header isn't "1": %v`, resp.Header.Get(XFromCache))
+		}
+	}
+}
+
+// HTTP dates must also be accepted in the obsolete RFC 850 and ANSI C
+// formats (RFC 9110 section 5.6.7).
+func TestDateObsoleteFormats(t *testing.T) {
+	resetTest()
+	want := time.Date(1994, time.November, 6, 8, 49, 37, 0, time.UTC)
+	for _, dateHeader := range []string{
+		"Sun, 06 Nov 1994 08:49:37 GMT",
+		"Sunday, 06-Nov-94 08:49:37 GMT",
+		"Sun Nov  6 08:49:37 1994",
+	} {
+		h := http.Header{}
+		h.Set("date", dateHeader)
+		got, err := Date(h)
+		if err != nil {
+			t.Fatalf("Date(%q) returned error: %v", dateHeader, err)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("Date(%q) = %v, want %v", dateHeader, got, want)
+		}
+	}
+}
+
+// The Age response header counts towards the response's current age
+// (RFC 9111 section 4.2.3).
+func TestAgeHeader(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "max-age=60")
+	respHeaders.Set("age", "120")
+
+	reqHeaders := http.Header{}
+	if getFreshness(respHeaders, reqHeaders) != stale {
+		t.Fatal("freshness isn't stale")
+	}
+
+	respHeaders.Set("age", "30")
+	if getFreshness(respHeaders, reqHeaders) != fresh {
+		t.Fatal("freshness isn't fresh")
+	}
+}
+
+// The X-From-Cache/X-Stale/X-Revalidated marker headers are for the caller
+// only and must not be persisted into stored cache entries.
+func TestMarkerHeadersNotStored(t *testing.T) {
+	resetTest()
+	req, err := http.NewRequest("GET", s.server.URL+"/etag", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		resp, err := s.client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	// The second request was revalidated and re-stored; the stored entry
+	// must not contain the marker headers.
+	data, ok := s.transport.Cache.Get(s.server.URL + "/etag")
+	if !ok {
+		t.Fatal("response isn't in cache")
+	}
+	for _, marker := range []string{XFromCache, XStale, XRevalidated} {
+		if bytes.Contains(data, []byte(marker)) {
+			t.Fatalf("stored cache entry contains marker header %q", marker)
+		}
+	}
+}
+
 // Test that http.Client.Timeout is respected when cache transport is used.
 // That is so as long as request cancellation is propagated correctly.
 // In the past, that required CancelRequest to be implemented correctly,
