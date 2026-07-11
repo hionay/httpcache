@@ -558,9 +558,11 @@ func parseCacheControl(headers http.Header) cacheControl {
 		}
 		if strings.ContainsRune(part, '=') {
 			keyval := strings.SplitN(part, "=", 2)
-			cc[strings.Trim(keyval[0], " ")] = strings.Trim(keyval[1], " ")
+			// directive names are case-insensitive (RFC 9111 section 5.2) and
+			// values may use the quoted-string form
+			cc[strings.ToLower(strings.Trim(keyval[0], " "))] = strings.Trim(keyval[1], ` "`)
 		} else {
-			cc[part] = ""
+			cc[strings.ToLower(part)] = ""
 		}
 	}
 	return cc

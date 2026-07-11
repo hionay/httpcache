@@ -1621,6 +1621,27 @@ func TestMarkerHeadersNotStored(t *testing.T) {
 	}
 }
 
+// Cache-Control directive names are case-insensitive (RFC 9111 section 5.2)
+// and values may use the quoted-string form.
+func TestParseCacheControlCaseAndQuotes(t *testing.T) {
+	resetTest()
+	h := http.Header{}
+	h.Set("cache-control", "No-Cache, MAX-AGE=3600")
+	cc := parseCacheControl(h)
+	if _, ok := cc["no-cache"]; !ok {
+		t.Fatal(`"no-cache" value isn't set`)
+	}
+	if cc["max-age"] != "3600" {
+		t.Fatalf(`"max-age" value isn't "3600": %v`, cc["max-age"])
+	}
+
+	h.Set("cache-control", `max-age="3600"`)
+	cc = parseCacheControl(h)
+	if cc["max-age"] != "3600" {
+		t.Fatalf(`quoted "max-age" value isn't "3600": %v`, cc["max-age"])
+	}
+}
+
 // A response with must-revalidate must never be served stale, even if the
 // request allows it via max-stale (RFC 9111 section 5.2.2.2).
 func TestMaxStaleWithMustRevalidate(t *testing.T) {
