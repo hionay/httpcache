@@ -197,8 +197,15 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			_ = drainBody(cachedResp.Body)
 		}
 
+		if _, ok := parseCacheControl(req.Header)["only-if-cached"]; ok {
+			// The cached entry can't be used as-is and only-if-cached forbids
+			// contacting the network (RFC 9111 section 5.2.1.7).
+			_ = drainBody(cachedResp.Body)
+			return newGatewayTimeoutResponse(req), nil
+		}
+
 		resp, err = transport.RoundTrip(req)
-		if err == nil && (req.Method == "GET" || req.Method == "HEAD") && resp.StatusCode == http.StatusNotModified {
+		if err == nil && resp.StatusCode == http.StatusNotModified {
 			// Replace the 304 response with the one from cache, but update with some new headers
 			endToEndHeaders := getEndToEndHeaders(resp.Header)
 			for _, header := range endToEndHeaders {
@@ -211,8 +218,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 				_ = drainBody(resp.Body)
 			}
 			resp = cachedResp
-		} else if (err != nil || resp.StatusCode >= 500) &&
-			(req.Method == "GET" || req.Method == "HEAD") && canStaleOnError(cachedResp.Header, req.Header) {
+		} else if (err != nil || resp.StatusCode >= 500) && canStaleOnError(cachedResp.Header, req.Header) {
 			// In case of transport failure and stale-if-error activated, returns cached content
 			// when available
 			if resp != nil {
@@ -332,13 +338,21 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 		return stale
 	}
 	if _, ok := reqCacheControl["only-if-cached"]; ok {
-		return fresh
+		// A stale must-revalidate response can't be reused without validation
+		// (RFC 9111 section 5.2.2.2), so it doesn't get the only-if-cached
+		// shortcut and falls through to the normal freshness check.
+		if _, mustRevalidate := respCacheControl["must-revalidate"]; !mustRevalidate {
+			return fresh
+		}
 	}
 
 	date, err := Date(respHeaders)
 	if err != nil {
 		return stale
 	}
+	// The cache doesn't store the response receipt time, so max(now-Date, Age)
+	// is the tightest available lower bound on the RFC 9111 section 4.2.3
+	// current age; it under-counts only when the origin's Date is skewed.
 	currentAge := clock.since(date)
 	if ageHeader := respHeaders.Get("Age"); ageHeader != "" {
 		if age, err := time.ParseDuration(ageHeader + "s"); err == nil && age > currentAge {
@@ -348,10 +362,12 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 
 	var lifetime time.Duration
 	var zeroDuration time.Duration
+	hasExplicitLifetime := false
 
 	// If a response includes both an Expires header and a max-age directive,
 	// the max-age directive overrides the Expires header, even if the Expires header is more restrictive.
 	if maxAge, ok := respCacheControl["max-age"]; ok {
+		hasExplicitLifetime = true
 		lifetime, err = time.ParseDuration(maxAge + "s")
 		if err != nil {
 			lifetime = zeroDuration
@@ -359,6 +375,7 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	} else {
 		expiresHeader := respHeaders.Get("Expires")
 		if expiresHeader != "" {
+			hasExplicitLifetime = true
 			expires, err := parseHTTPDate(expiresHeader)
 			if err != nil {
 				lifetime = zeroDuration
@@ -370,12 +387,13 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 
 	if maxAge, ok := reqCacheControl["max-age"]; ok {
 		// the client is willing to accept a response whose age is no greater than the
-		// specified time in seconds; it can only tighten the lifetime, never extend it
+		// specified time in seconds; it can only tighten an explicit lifetime, but may
+		// serve as the heuristic lifetime for a response with no expiration information
 		reqLifetime, err := time.ParseDuration(maxAge + "s")
 		if err != nil {
 			reqLifetime = zeroDuration
 		}
-		if reqLifetime < lifetime {
+		if !hasExplicitLifetime || reqLifetime < lifetime {
 			lifetime = reqLifetime
 		}
 	}
@@ -387,11 +405,11 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 		}
 	}
 
-	if maxstale, ok := reqCacheControl["max-stale"]; ok {
-		// A response with must-revalidate can never be served stale (RFC 9111 section 5.2.2.2).
-		if _, mustRevalidate := respCacheControl["must-revalidate"]; mustRevalidate {
-			return stale
-		}
+	// A response with must-revalidate can never be served stale, so max-stale
+	// doesn't apply to it (RFC 9111 section 5.2.2.2); a still-fresh response
+	// falls through to the normal freshness check.
+	_, mustRevalidate := respCacheControl["must-revalidate"]
+	if maxstale, ok := reqCacheControl["max-stale"]; ok && !mustRevalidate {
 		// Indicates that the client is willing to accept a response that has exceeded its expiration time.
 		// If max-stale is assigned a value, then the client is willing to accept a response that has exceeded
 		// its expiration time by no more than the specified number of seconds.
@@ -551,7 +569,7 @@ type cacheControl map[string]string
 func parseCacheControl(headers http.Header) cacheControl {
 	cc := cacheControl{}
 	ccHeader := headers.Get("Cache-Control")
-	for part := range strings.SplitSeq(ccHeader, ",") {
+	for _, part := range splitQuoted(ccHeader, ',') {
 		part = strings.Trim(part, " ")
 		if part == "" {
 			continue
@@ -559,13 +577,37 @@ func parseCacheControl(headers http.Header) cacheControl {
 		if strings.ContainsRune(part, '=') {
 			keyval := strings.SplitN(part, "=", 2)
 			// directive names are case-insensitive (RFC 9111 section 5.2) and
-			// values may use the quoted-string form
-			cc[strings.ToLower(strings.Trim(keyval[0], " "))] = strings.Trim(keyval[1], ` "`)
+			// values may use the quoted-string form; a malformed empty quoted
+			// value is kept as-is so it stays distinct from a valueless directive
+			val := strings.Trim(keyval[1], " ")
+			if unquoted := strings.Trim(val, `"`); unquoted != "" {
+				val = unquoted
+			}
+			cc[strings.ToLower(strings.Trim(keyval[0], " "))] = val
 		} else {
 			cc[strings.ToLower(part)] = ""
 		}
 	}
 	return cc
+}
+
+// splitQuoted splits s on sep, ignoring separators inside double-quoted
+// strings. Quoted-pair escapes aren't handled; they don't occur in
+// Cache-Control values in practice.
+func splitQuoted(s string, sep rune) []string {
+	var parts []string
+	var inQuotes bool
+	last := 0
+	for i, r := range s {
+		switch {
+		case r == '"':
+			inQuotes = !inQuotes
+		case r == sep && !inQuotes:
+			parts = append(parts, s[last:i])
+			last = i + 1
+		}
+	}
+	return append(parts, s[last:])
 }
 
 // headerAllCommaSepValues returns all comma-separated values (each
