@@ -1920,6 +1920,93 @@ func TestStaleIfErrorHead(t *testing.T) {
 	}
 }
 
+// An unbalanced quote must not swallow the directives after it.
+func TestParseCacheControlUnbalancedQuote(t *testing.T) {
+	resetTest()
+	h := http.Header{}
+	h.Set("cache-control", `community="UCI, no-store, max-age=0`)
+	cc := parseCacheControl(h)
+	if _, ok := cc["no-store"]; !ok {
+		t.Fatal(`"no-store" directive isn't set`)
+	}
+	if cc["max-age"] != "0" {
+		t.Fatalf(`"max-age" value isn't "0": %v`, cc["max-age"])
+	}
+}
+
+// Directives on additional Cache-Control field lines must be seen
+// (RFC 9110 section 5.3 field-line combining).
+func TestParseCacheControlMultipleHeaders(t *testing.T) {
+	resetTest()
+	h := http.Header{}
+	h.Add("cache-control", "max-age=300")
+	h.Add("cache-control", "no-store")
+	cc := parseCacheControl(h)
+	if _, ok := cc["no-store"]; !ok {
+		t.Fatal(`"no-store" directive isn't set`)
+	}
+	if cc["max-age"] != "300" {
+		t.Fatalf(`"max-age" value isn't "300": %v`, cc["max-age"])
+	}
+}
+
+// A half-quoted value is kept verbatim (and fails duration parsing) instead
+// of silently becoming valid.
+func TestParseCacheControlHalfQuotedValue(t *testing.T) {
+	resetTest()
+	h := http.Header{}
+	h.Set("cache-control", `max-age="60`)
+	cc := parseCacheControl(h)
+	if cc["max-age"] != `"60` {
+		t.Fatalf(`"max-age" value isn't kept verbatim: %v`, cc["max-age"])
+	}
+}
+
+// only-if-cached serves only responses satisfying normal freshness
+// constraints; stale entries are unusable unless max-stale permits them
+// (RFC 9111 section 5.2.1.7).
+func TestOnlyIfCachedStale(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "max-age=10")
+
+	reqHeaders := http.Header{}
+	reqHeaders.Set("cache-control", "only-if-cached")
+	clock = &fakeClock{elapsed: 60 * time.Second}
+	if getFreshness(respHeaders, reqHeaders) != stale {
+		t.Fatal("freshness isn't stale")
+	}
+
+	// max-stale is the explicit opt-in for stale content
+	reqHeaders.Set("cache-control", "only-if-cached, max-stale")
+	if getFreshness(respHeaders, reqHeaders) != fresh {
+		t.Fatal("freshness isn't fresh")
+	}
+}
+
+// The stale-if-error window starts when the response becomes stale, not when
+// it was generated (RFC 5861): freshness lifetime plus the stale-if-error value.
+func TestStaleIfErrorWindowStartsAtStaleness(t *testing.T) {
+	resetTest()
+	now := time.Now()
+	respHeaders := http.Header{}
+	respHeaders.Set("date", now.Format(time.RFC1123))
+	respHeaders.Set("cache-control", "max-age=3600, stale-if-error=60")
+
+	reqHeaders := http.Header{}
+	clock = &fakeClock{elapsed: 3630 * time.Second}
+	if !canStaleOnError(respHeaders, reqHeaders) {
+		t.Fatal("canStaleOnError should be true 30s into the stale-if-error window")
+	}
+
+	clock = &fakeClock{elapsed: 3700 * time.Second}
+	if canStaleOnError(respHeaders, reqHeaders) {
+		t.Fatal("canStaleOnError should be false past the stale-if-error window")
+	}
+}
+
 // Test that http.Client.Timeout is respected when cache transport is used.
 // That is so as long as request cancellation is propagated correctly.
 // In the past, that required CancelRequest to be implemented correctly,

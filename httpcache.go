@@ -148,6 +148,7 @@ func varyMatches(cachedResp *http.Response, req *http.Request) bool {
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	cacheKey := cacheKey(req)
 	cacheable := (req.Method == "GET" || req.Method == "HEAD") && req.Header.Get("range") == ""
+	reqCacheControl := parseCacheControl(req.Header)
 	var cachedResp *http.Response
 	if cacheable {
 		cachedResp, err = CachedResponse(t.Cache, req)
@@ -166,8 +167,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			cachedResp.Header.Set(XFromCache, "1")
 		}
 
-		if varyMatches(cachedResp, req) && cachedResp.StatusCode < http.StatusInternalServerError {
-			// Can only use cached value if the new request doesn't Vary significantly
+		// Can only use cached value if the new request doesn't Vary significantly
+		usable := varyMatches(cachedResp, req) && cachedResp.StatusCode < http.StatusInternalServerError
+		if usable {
 			freshness := getFreshness(cachedResp.Header, req.Header)
 			if freshness == fresh {
 				return cachedResp, nil
@@ -197,10 +199,13 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			_ = drainBody(cachedResp.Body)
 		}
 
-		if _, ok := parseCacheControl(req.Header)["only-if-cached"]; ok {
+		if _, ok := reqCacheControl["only-if-cached"]; ok {
 			// The cached entry can't be used as-is and only-if-cached forbids
 			// contacting the network (RFC 9111 section 5.2.1.7).
-			_ = drainBody(cachedResp.Body)
+			if usable {
+				// not drained yet: we got here via the stale/transparent path
+				_ = drainBody(cachedResp.Body)
+			}
 			return newGatewayTimeoutResponse(req), nil
 		}
 
@@ -237,7 +242,6 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			}
 		}
 	} else {
-		reqCacheControl := parseCacheControl(req.Header)
 		if _, ok := reqCacheControl["only-if-cached"]; ok {
 			// Don't fall through to the store block: the synthetic 504
 			// must not be written to the cache.
@@ -249,7 +253,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 		}
 	}
 
-	if cacheable && canStore(parseCacheControl(req.Header), parseCacheControl(resp.Header)) {
+	if cacheable && canStore(reqCacheControl, parseCacheControl(resp.Header)) {
 		for _, varyKey := range headerAllCommaSepValues(resp.Header, "vary") {
 			varyKey = http.CanonicalHeaderKey(varyKey)
 			fakeHeader := "X-Varied-" + varyKey
@@ -337,61 +341,21 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	if _, ok := respCacheControl["no-cache"]; ok {
 		return stale
 	}
-	if _, ok := reqCacheControl["only-if-cached"]; ok {
-		// A stale must-revalidate response can't be reused without validation
-		// (RFC 9111 section 5.2.2.2), so it doesn't get the only-if-cached
-		// shortcut and falls through to the normal freshness check.
-		if _, mustRevalidate := respCacheControl["must-revalidate"]; !mustRevalidate {
-			return fresh
-		}
-	}
-
 	date, err := Date(respHeaders)
 	if err != nil {
 		return stale
 	}
-	// The cache doesn't store the response receipt time, so max(now-Date, Age)
-	// is the tightest available lower bound on the RFC 9111 section 4.2.3
-	// current age; it under-counts only when the origin's Date is skewed.
-	currentAge := clock.since(date)
-	if ageHeader := respHeaders.Get("Age"); ageHeader != "" {
-		if age, err := time.ParseDuration(ageHeader + "s"); err == nil && age > currentAge {
-			currentAge = age
-		}
-	}
-
-	var lifetime time.Duration
-	var zeroDuration time.Duration
-	hasExplicitLifetime := false
-
-	// If a response includes both an Expires header and a max-age directive,
-	// the max-age directive overrides the Expires header, even if the Expires header is more restrictive.
-	if maxAge, ok := respCacheControl["max-age"]; ok {
-		hasExplicitLifetime = true
-		lifetime, err = time.ParseDuration(maxAge + "s")
-		if err != nil {
-			lifetime = zeroDuration
-		}
-	} else {
-		expiresHeader := respHeaders.Get("Expires")
-		if expiresHeader != "" {
-			hasExplicitLifetime = true
-			expires, err := parseHTTPDate(expiresHeader)
-			if err != nil {
-				lifetime = zeroDuration
-			} else {
-				lifetime = expires.Sub(date)
-			}
-		}
-	}
+	currentAge := responseAge(respHeaders, date)
+	lifetime, hasExplicitLifetime := respLifetime(respHeaders, respCacheControl, date)
 
 	if maxAge, ok := reqCacheControl["max-age"]; ok {
 		// the client is willing to accept a response whose age is no greater than the
-		// specified time in seconds; it can only tighten an explicit lifetime, but may
-		// serve as the heuristic lifetime for a response with no expiration information
+		// specified time in seconds; it can only tighten an explicit lifetime, but is
+		// used as the heuristic lifetime (RFC 9111 section 4.2.2) for a response with
+		// no expiration information — a deliberate policy for this private cache
 		reqLifetime, err := time.ParseDuration(maxAge + "s")
 		if err != nil {
-			reqLifetime = zeroDuration
+			reqLifetime = 0
 		}
 		if !hasExplicitLifetime || reqLifetime < lifetime {
 			lifetime = reqLifetime
@@ -434,6 +398,43 @@ func getFreshness(respHeaders, reqHeaders http.Header) (freshness int) {
 	return stale
 }
 
+// responseAge returns the response's current age. The cache doesn't store the
+// response receipt time, so max(now-Date, Age) is the tightest available lower
+// bound on the RFC 9111 section 4.2.3 current age; it under-counts only when
+// the origin's Date is skewed.
+func responseAge(respHeaders http.Header, date time.Time) time.Duration {
+	age := clock.since(date)
+	if ageHeader := respHeaders.Get("Age"); ageHeader != "" {
+		if v, err := time.ParseDuration(ageHeader + "s"); err == nil && v > age {
+			age = v
+		}
+	}
+	return age
+}
+
+// respLifetime returns the response's explicit freshness lifetime and whether
+// the response carries any expiration information (max-age or Expires). If a
+// response includes both an Expires header and a max-age directive, the
+// max-age directive overrides the Expires header, even if the Expires header
+// is more restrictive.
+func respLifetime(respHeaders http.Header, respCacheControl cacheControl, date time.Time) (time.Duration, bool) {
+	if maxAge, ok := respCacheControl["max-age"]; ok {
+		lifetime, err := time.ParseDuration(maxAge + "s")
+		if err != nil {
+			return 0, true
+		}
+		return lifetime, true
+	}
+	if expiresHeader := respHeaders.Get("Expires"); expiresHeader != "" {
+		expires, err := parseHTTPDate(expiresHeader)
+		if err != nil {
+			return 0, true
+		}
+		return expires.Sub(date), true
+	}
+	return 0, false
+}
+
 // Returns true if either the request or the response includes the stale-if-error
 // cache control extension: https://tools.ietf.org/html/rfc5861
 func canStaleOnError(respHeaders, reqHeaders http.Header) bool {
@@ -446,11 +447,11 @@ func canStaleOnError(respHeaders, reqHeaders http.Header) bool {
 	}
 
 	var err error
-	lifetime := time.Duration(-1)
+	staleWindow := time.Duration(-1)
 
 	if staleMaxAge, ok := respCacheControl["stale-if-error"]; ok {
 		if staleMaxAge != "" {
-			lifetime, err = time.ParseDuration(staleMaxAge + "s")
+			staleWindow, err = time.ParseDuration(staleMaxAge + "s")
 			if err != nil {
 				return false
 			}
@@ -460,7 +461,7 @@ func canStaleOnError(respHeaders, reqHeaders http.Header) bool {
 	}
 	if staleMaxAge, ok := reqCacheControl["stale-if-error"]; ok {
 		if staleMaxAge != "" {
-			lifetime, err = time.ParseDuration(staleMaxAge + "s")
+			staleWindow, err = time.ParseDuration(staleMaxAge + "s")
 			if err != nil {
 				return false
 			}
@@ -469,18 +470,15 @@ func canStaleOnError(respHeaders, reqHeaders http.Header) bool {
 		}
 	}
 
-	if lifetime >= 0 {
+	if staleWindow >= 0 {
 		date, err := Date(respHeaders)
 		if err != nil {
 			return false
 		}
-		currentAge := clock.since(date)
-		if ageHeader := respHeaders.Get("Age"); ageHeader != "" {
-			if age, err := time.ParseDuration(ageHeader + "s"); err == nil && age > currentAge {
-				currentAge = age
-			}
-		}
-		if lifetime > currentAge {
+		// The window starts when the response becomes stale (RFC 5861):
+		// freshness lifetime plus the stale-if-error value.
+		lifetime, _ := respLifetime(respHeaders, respCacheControl, date)
+		if lifetime+staleWindow > responseAge(respHeaders, date) {
 			return true
 		}
 	}
@@ -568,7 +566,9 @@ type cacheControl map[string]string
 
 func parseCacheControl(headers http.Header) cacheControl {
 	cc := cacheControl{}
-	ccHeader := headers.Get("Cache-Control")
+	// directives may be spread across multiple Cache-Control field lines
+	// (RFC 9110 section 5.3)
+	ccHeader := strings.Join(headers.Values("Cache-Control"), ",")
 	for _, part := range splitQuoted(ccHeader, ',') {
 		part = strings.Trim(part, " ")
 		if part == "" {
@@ -577,11 +577,14 @@ func parseCacheControl(headers http.Header) cacheControl {
 		if strings.ContainsRune(part, '=') {
 			keyval := strings.SplitN(part, "=", 2)
 			// directive names are case-insensitive (RFC 9111 section 5.2) and
-			// values may use the quoted-string form; a malformed empty quoted
-			// value is kept as-is so it stays distinct from a valueless directive
+			// values may use the quoted-string form; malformed values (half
+			// quoted or empty quoted) are kept verbatim so they fail parsing
+			// instead of silently becoming valid
 			val := strings.Trim(keyval[1], " ")
-			if unquoted := strings.Trim(val, `"`); unquoted != "" {
-				val = unquoted
+			if len(val) >= 2 && strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) {
+				if unquoted := val[1 : len(val)-1]; unquoted != "" {
+					val = unquoted
+				}
 			}
 			cc[strings.ToLower(strings.Trim(keyval[0], " "))] = val
 		} else {
@@ -606,6 +609,12 @@ func splitQuoted(s string, sep rune) []string {
 			parts = append(parts, s[last:i])
 			last = i + 1
 		}
+	}
+	if inQuotes {
+		// An unbalanced quote would swallow every later directive; fail safe
+		// by splitting on every separator so directives like no-store aren't
+		// lost to a malformed value.
+		return strings.Split(s, string(sep))
 	}
 	return append(parts, s[last:])
 }
